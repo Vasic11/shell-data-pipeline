@@ -167,6 +167,9 @@ cmd_run() {
 
     set_defaults
     load_config "$cli_config"
+    if [[ -n "$cli_workers" ]]; then
+        CONF[workers]="$cli_workers"
+    fi
     validate_config
     for k in "${!CONF[@]}"; do
         echo "$k=${CONF[$k]}"
