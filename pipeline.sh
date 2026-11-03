@@ -59,6 +59,59 @@ load_config(){
 }
 
 
+is_pos_int() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
+}
+
+is_nonneg_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+validate_config(){
+    local k
+
+    [[ -n "${CONF[processor]}" ]] || die "obavezan kljuc 'processor' nije zadat u konfigu"
+
+    # pozitivni celi br
+    for k in chunk_lines workers hang_timeout; do
+        is_pos_int "${CONF[$k]}" ||  die "neispravna vrednost za $k: '${CONF[$k]}' (ocekuje se pozitivan ceo broj)"
+    done
+
+    for k in max_retries backoff_base backoff_max kill_grace max_failed_chunks; do
+        is_nonneg_int "${CONF[$k]}" || die "neispravna vrednost za $k: '${CONF[$k]}' (ocekuje se ceo broj >= 0)"
+    done
+
+    case "${CONF[group_by]}" in
+        region|category)
+        ;;
+        *)
+        die "neispravna vrednost za group_by: '${CONF[group_by]}' (dozvoljeno: region, category)"
+        ;;
+    esac
+
+    case "${CONF[keep_chunks]}" in
+        yes|no)
+        ;;
+        *)
+        die "neispravna vrednost za keep_chunks: '${CONF[keep_chunks]}' (dozvoljeno: yes, no)"
+        ;;
+    esac
+
+    case "${CONF[log_level]}" in
+        DEBUG|INFO|WARN|ERROR)
+        ;;
+        *)
+        die "neispravna vrednost za log_level: '${CONF[log_level]}' (dozvoljeno: DEBUG, INFO, WARN ili ERROR)"
+        ;;
+    esac
+
+    for k in python work_dir; do   
+        [[ -n "${CONF[$k]}" ]] || die "vrednost za $k ne sme biti prazna"
+    done
+
+}
+
+
 # Rezim rada
 
 cmd_help() {
@@ -114,7 +167,7 @@ cmd_run() {
 
     set_defaults
     load_config "$cli_config"
-
+    validate_config
     for k in "${!CONF[@]}"; do
         echo "$k=${CONF[$k]}"
     done
