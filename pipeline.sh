@@ -1,12 +1,63 @@
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+declare -A CONF
+
 # Pomocne funkcije
 
 die() {
     echo "ERROR: $1" >&2
     exit "${2:-2}"
 }
+
+set_defaults(){
+    CONF[python]="python3"
+    CONF[group_by]="region"
+    CONF[chunk_lines]=100000
+    CONF[workers]=4
+    CONF[max_retries]=3
+    CONF[backoff_base]=1
+    CONF[backoff_max]=30
+    CONF[hang_timeout]=10
+    CONF[kill_grace]=3
+    CONF[max_failed_chunks]=2
+    CONF[work_dir]="./runs"
+    CONF[keep_chunks]="no"
+    CONF[log_level]="INFO"
+}
+
+load_config(){
+    local fajl="$1"
+    local linija kljuc vrednost
+    [[ -f "$fajl" ]] || die "konfig fajl ne postoji: $fajl"
+    [[ -r "$fajl" ]] || die "konfig fajl ne moze da se cita: $fajl"
+
+    while IFS= read -r linija || [[ -n "$linija" ]]; do
+
+        read -r linija <<< "$linija"
+
+        if [[ -z "$linija" || "$linija" == \#* ]]; then
+            continue
+        fi
+        [[ "$linija" == *=* ]] || die "neispravna linija u konfigu: $linija"
+        
+        kljuc="${linija%%=*}"
+        vrednost="${linija#*=}"
+
+        read -r kljuc <<< "$kljuc"
+        read -r vrednost <<< "$vrednost"
+        
+        case "$kljuc" in
+            processor|python|group_by|chunk_lines|workers|max_retries|backoff_base|backoff_max|hang_timeout|kill_grace|max_failed_chunks|work_dir|keep_chunks|log_level) 
+                CONF[$kljuc]="$vrednost"
+                ;;
+            *)
+                echo "WARN: nepoznat kljuc: $kljuc" >&2
+                ;;
+        esac
+        done < "$fajl"
+}
+
 
 # Rezim rada
 
@@ -61,9 +112,12 @@ cmd_run() {
 
     [[ -n "$cli_input" ]] || die "opcija --input je obavezna"
 
-    echo "input=$cli_input"
-    echo "config=$cli_config"
-    echo "workers=$cli_workers"
+    set_defaults
+    load_config "$cli_config"
+
+    for k in "${!CONF[@]}"; do
+        echo "$k=${CONF[$k]}"
+    done
 
 }
 
