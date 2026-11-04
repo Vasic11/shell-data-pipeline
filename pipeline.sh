@@ -5,6 +5,7 @@ declare -A CONF
 RUN_ID=""
 RUN_DIR=""
 LOG_FILE=""
+CONFIG_WARNINGS=()
 # Pomocne funkcije
 
 die() {
@@ -53,6 +54,25 @@ create_run_dir(){
 
     mkdir -p "$RUN_DIR"/{chunks,results,logs} || die "ne mogu da napravim folder: $RUN_DIR"
     LOG_FILE="$RUN_DIR/pipeline.log"
+    touch "$LOG_FILE"
+}
+
+write_snapshot(){
+    local k
+    for k in "${!CONF[@]}"; do
+        echo "$k=${CONF[$k]}"
+    done | sort > "$RUN_DIR/config.snapshot"
+
+}
+
+write_meta(){
+    cat > "$RUN_DIR/run.meta" <<EOF
+run_id=$RUN_ID
+input=$cli_input
+started=$(date '+%Y-%m-%d %H:%M:%S')
+status=running
+EOF
+
 }
 
 set_defaults(){
@@ -97,7 +117,7 @@ load_config(){
                 CONF[$kljuc]="$vrednost"
                 ;;
             *)
-                echo "WARN: nepoznat kljuc: $kljuc" >&2
+                CONFIG_WARNINGS+=("nepoznat kljuc u konfikgu: $kljuc")
                 ;;
         esac
         done < "$fajl"
@@ -247,12 +267,15 @@ cmd_run() {
     validate_config
     preflight_checks "$cli_input"
     create_run_dir
+    write_snapshot
+    write_meta
     log INFO "Run $RUN_ID started (input=$cli_input, workers=${CONF[workers]})"
+    for w in "${CONFIG_WARNINGS[@]}"; do
+        log WARN "$w"
+    done
     echo "RUN $RUN_ID started"
 
-    #for k in "${!CONF[@]}"; do
-    #    echo "$k=${CONF[$k]}"
-    #done
+
 
 }
 
