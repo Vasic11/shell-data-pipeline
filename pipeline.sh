@@ -111,6 +111,35 @@ validate_config(){
 
 }
 
+# Obrada gresaka
+preflight_checks() {
+    local ulaz="$1"
+    local ocekivano="transaction_id,timestamp,region,category,amount,quantity"
+    local zaglavlje velicina slobodno
+
+    #python i processor
+    command -v "${CONF[python]}" >/dev/null || die "python interapter ne postoji: ${CONF[python]}"
+    [[ -f "${CONF[processor]}" ]] || die "processor fajl ne postoji: ${CONF[processor]}"
+    #ulazni fajl
+    [[ -f "$ulaz" ]] || die "ne postoji ulazni fajl: $ulaz"
+    [[ -r "$ulaz" ]] || die "ulazni fajl nije za citanej: $ulaz"
+    [[ -s "$ulaz" ]] || die "ulazni fajl je prazan: $ulaz"
+    
+    zaglavlje="$(head -n 1 "$ulaz")"
+    [[ "$zaglavlje" == "$ocekivano" ]] || die "fajl ima pogresno zaglavlje: $zaglavlje (ocekivano: $ocekivano)"
+
+    #work_dir
+    mkdir -p "${CONF[work_dir]}" 2>/dev/null || die "ne mogu da napravim work_dir: ${CONF[work_dir]}"
+    [[ -w "${CONF[work_dir]}" ]] || die "ne mogu da pisem u work_die: ${CONF[wokr_dir]}"
+
+
+    #prostor na disku
+    velicina="$(stat -c %s "$ulaz")"
+    slobodno="$(df --output=avail -B1 "${CONF[work_dir]}" | tail -n 1)"
+    (( slobodno >= velicina*2 )) || die "nema dovoljno prostora na disku"
+
+}
+
 
 # Rezim rada
 
@@ -171,9 +200,12 @@ cmd_run() {
         CONF[workers]="$cli_workers"
     fi
     validate_config
-    for k in "${!CONF[@]}"; do
-        echo "$k=${CONF[$k]}"
-    done
+    preflight_checks "$cli_input"
+    echo "sve provere su prosle"
+
+    #for k in "${!CONF[@]}"; do
+    #    echo "$k=${CONF[$k]}"
+    #done
 
 }
 
