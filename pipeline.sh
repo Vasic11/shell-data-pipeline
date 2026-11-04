@@ -75,6 +75,36 @@ EOF
 
 }
 
+
+split_input(){
+    local ulaz="$1"
+    local zaglavlje ukupno zbir f n
+    local delovi=()
+
+    zaglavlje="$(head -n 1 "$ulaz")"
+    ukupno=$(( $(wc -l < "$ulaz") - 1 ))
+    (( ukupno > 0 )) || die "ulaz fajla nema redove s podacima"
+
+    #podela bez zaglavlja
+    tail -n +2 "$ulaz" | split -l "${CONF[chunk_lines]}" -d -a 5 --numeric-suffixes=1 --additional-suffix=.csv - "$RUN_DIR/chunks/chunk_" \
+        || die "deljenje ulaza nije uspelo"
+
+    delovi=( "$RUN_DIR"/chunks/chunk_*.csv )
+    for f in "${delovi[@]}"; do
+        { echo "$zaglavlje"; cat "$f"; } > "$f.tmp" && mv "$f.tmp" "$f"
+    done
+
+     # 3) provera: zbir redova u delovima = redovi u ulazu   
+    zbir=0
+    for f in "${delovi[@]}"; do
+        n=$(( $(wc -l < "$f") - 1 ))
+        (( zbir += n ))
+    done
+    (( zbir == ukupno )) || die "provera deljenja nije prosla: ulaz $ukupno redova, delovi $zbir"
+
+    log INFO "Split into ${#delovi[@]} chunks ($ukupno rows)"
+}
+
 set_defaults(){
     CONF[python]="python3"
     CONF[group_by]="region"
@@ -273,6 +303,7 @@ cmd_run() {
     for w in "${CONFIG_WARNINGS[@]}"; do
         log WARN "$w"
     done
+    split_input "$cli_input"
     echo "RUN $RUN_ID started"
 
 
