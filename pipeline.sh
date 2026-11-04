@@ -2,12 +2,57 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 declare -A CONF
-
+RUN_ID=""
+RUN_DIR=""
+LOG_FILE=""
 # Pomocne funkcije
 
 die() {
     echo "ERROR: $1" >&2
+    log ERROR "$1"
     exit "${2:-2}"
+}
+
+level_num(){
+    case "$1" in
+        DEBUG)
+        echo 0
+        ;;
+        INFO)
+        echo 1
+        ;;
+        WARN)
+        echo 2
+        ;;
+        ERROR)
+        echo 3
+        ;;
+    esac
+}
+
+log(){
+    local nivo="$1"
+    local poruka="$2"
+    local linija=""
+
+    [[ -n "$LOG_FILE" ]] || return 0
+     
+    (( $(level_num "$nivo") >= $(level_num "${CONF[log_level]}") )) || return 0
+
+    linija="[$(date '+%Y-%m-%d %H:%M:%S')] $nivo: $poruka"
+
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "$linija" >> "$LOG_FILE"
+    fi
+}
+
+
+create_run_dir(){
+    RUN_ID="run_$(date '+%Y%m%d_%H%M%S')"
+    RUN_DIR="${CONF[work_dir]}/$RUN_ID"
+
+    mkdir -p "$RUN_DIR"/{chunks,results,logs} || die "ne mogu da napravim folder: $RUN_DIR"
+    LOG_FILE="$RUN_DIR/pipeline.log"
 }
 
 set_defaults(){
@@ -130,7 +175,7 @@ preflight_checks() {
 
     #work_dir
     mkdir -p "${CONF[work_dir]}" 2>/dev/null || die "ne mogu da napravim work_dir: ${CONF[work_dir]}"
-    [[ -w "${CONF[work_dir]}" ]] || die "ne mogu da pisem u work_die: ${CONF[wokr_dir]}"
+    [[ -w "${CONF[work_dir]}" ]] || die "ne mogu da pisem u work_dir: ${CONF[work_dir]}"
 
 
     #prostor na disku
@@ -201,7 +246,9 @@ cmd_run() {
     fi
     validate_config
     preflight_checks "$cli_input"
-    echo "sve provere su prosle"
+    create_run_dir
+    log INFO "Run $RUN_ID started (input=$cli_input, workers=${CONF[workers]})"
+    echo "RUN $RUN_ID started"
 
     #for k in "${!CONF[@]}"; do
     #    echo "$k=${CONF[$k]}"
