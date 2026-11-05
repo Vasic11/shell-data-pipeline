@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 declare -A CONF
@@ -169,6 +170,53 @@ process_chunks(){
         ime="${ime%.csv}"
         run_chunk "$ime" 1
     done
+}
+
+merge_results(){
+    local f ime cilj
+    local zaglavlje="group,count,sum_amount,avg_amount,min_amount,max_amount,sum_quantity"
+    local rezultati=( "$RUN_DIR"/results/*.out )
+    local delovi=( "$RUN_DIR"/chunks/chunk_*.csv ) 
+
+    #gotovi delovi: result.csv inace result.partial.csv
+    if (( ${#rezultati[@]} == ${#delovi[@]} )); then
+        cilj="$RUN_DIR/result.csv"
+    else
+        cilj="$RUN_DIR/result.partial.csv"
+    fi
+
+    #jos jedna provera
+    for f in "${rezultati[@]}"; do
+        ime="${f##*/}"
+        ime="${ime%.out}"
+        validate_output "$f" "$RUN_DIR/chunks/$ime.csv" || die "rezultat nije ispravan: $ime"
+    done
+
+    # 3) spoji, sortiraj i upiši u privremeni fajl
+    {
+        echo "$zaglavlje"
+        awk -F, '
+            FNR == 1 || /^#END/ { next }
+            {
+                g = $1
+                cnt[g] += $2
+                sum[g] += $3
+                qty[g] += $6
+                if (!(g in mn) || $4 + 0 < mn[g]) mn[g] = $4 + 0
+                if (!(g in mx) || $5 + 0 > mx[g] ) mx[g] = $5 + 0
+            }
+            END {
+                for (g in cnt)
+                    printf "%s,%d,%.2f,%.2f,%.2f,%.2f,%d\n", g, cnt[g], sum[g], sum[g] / cnt[g], mn[g], mx[g], qty[g]
+            }
+        ' "${rezultati[@]}" | LC_ALL=C sort -t, -k1,1
+    } > "$cilj.tmp" || die "spajanje rezultata nije uspelo"
+
+     #premesti na konacno mesto
+    mv "$cilj.tmp" "$cilj"
+    log INFO "Merged ${#rezultati[@]} results into ${cilj##*/}"
+
+
 }
 
 set_defaults(){
@@ -371,7 +419,8 @@ cmd_run() {
     done
     split_input "$cli_input"
     process_chunks
-    echo "RUN $RUN_ID started"
+    merge_results
+    echo "Run $RUN_ID finished (result: $RUN_DIR/result.csv)"
 
 
 
