@@ -105,6 +105,34 @@ split_input(){
     log INFO "Split into ${#delovi[@]} chunks ($ukupno rows)"
 }
 
+
+validate_output(){
+    local izlaz="$1"
+    local ulaz="$2"
+    local ocekivano="group,count,sum_amount,min_amount,max_amount,sum_quantity"
+    local poslednja rows_in groups redova_ulaz redova_grupa
+    
+    [[ -s "$izlaz" ]] || return 1
+    #zaglavlje nije isto
+    [[ $(head -n 1 "$izlaz") == "$ocekivano" ]] || return 1
+
+    #linija END
+    poslednja="$(tail -n 1 "$izlaz")"
+    [[ "$poslednja" =~ ^#END\ rows_in=([0-9]+)\ rows_skipped=([0-9]+)\ groups=([0-9]+)$ ]] || return 1
+    rows_in="${BASH_REMATCH[1]}"
+    groups="${BASH_REMATCH[3]}"
+
+    #broj redova ulaz
+    redova_ulaz=$(( $(wc -l < "$ulaz") - 1 ))
+    (( rows_in ==  redova_ulaz)) || return 1
+
+    #groups = broj redova sa grupama
+    redova_grupa=$(( $(wc -l < "$izlaz") - 2 ))
+    (( groups == redova_grupa )) || return 1
+
+    return 0
+}
+
 run_chunk(){
     local ime="$1"
     local pokusaj="$2"
@@ -120,9 +148,13 @@ run_chunk(){
         2> "$err"
     kod=$?
 
-    if (( kod == 0 )); then
+    if (( kod == 0 )) && validate_output "$izlaz_tmp" "$ulaz"; then
         mv "$izlaz_tmp" "$RUN_DIR/results/$ime.out"
         log INFO "$ime attempt $pokusaj done"
+    elif (( kod == 0 )); then
+        rm -f "$izlaz_tmp"
+        log WARN "$ime attempt $pokusaj failed (exit=0, reason=corrupt)"
+        kod=1
     else
         rm -f "$izlaz_tmp"
         log WARN "$ime attempt $pokusaj failed (exit=$kod)"
