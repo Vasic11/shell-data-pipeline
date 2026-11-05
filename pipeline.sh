@@ -105,6 +105,40 @@ split_input(){
     log INFO "Split into ${#delovi[@]} chunks ($ukupno rows)"
 }
 
+run_chunk(){
+    local ime="$1"
+    local pokusaj="$2"
+    local ulaz="$RUN_DIR/chunks/$ime.csv"
+    local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
+    local err="$RUN_DIR/logs/$ime.$pokusaj.err"
+    local kod
+
+    log INFO "$ime attempt $pokusaj started"
+
+    "${CONF[python]}" "${CONF[processor]}" \
+        --input "$ulaz" --output "$izlaz_tmp" --group-by "${CONF[group_by]}" \
+        2> "$err"
+    kod=$?
+
+    if (( kod == 0 )); then
+        mv "$izlaz_tmp" "$RUN_DIR/results/$ime.out"
+        log INFO "$ime attempt $pokusaj done"
+    else
+        rm -f "$izlaz_tmp"
+        log WARN "$ime attempt $pokusaj failed (exit=$kod)"
+    fi
+    return "$kod"
+}
+
+process_chunks(){
+    local f ime
+    for f in "$RUN_DIR"/chunks/chunk_*.csv; do
+        ime="${f##*/}"
+        ime="${ime%.csv}"
+        run_chunk "$ime" 1
+    done
+}
+
 set_defaults(){
     CONF[python]="python3"
     CONF[group_by]="region"
@@ -304,6 +338,7 @@ cmd_run() {
         log WARN "$w"
     done
     split_input "$cli_input"
+    process_chunks
     echo "RUN $RUN_ID started"
 
 
