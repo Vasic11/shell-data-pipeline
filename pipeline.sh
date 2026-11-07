@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+shopt -s nullglob #  ako *.out ne nađe nijedan fajl, niz je prazan (umesto da sadrži sam tekst "*.out")
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -7,12 +8,20 @@ RUN_ID=""
 RUN_DIR=""
 LOG_FILE=""
 CONFIG_WARNINGS=()
+MANIFEST=""
+declare -A PID_OF        # deo  PID procesa koji ga obradjuje
+declare -A START_OF      # deo  vreme pocetka (za duration_s)
+declare -A ATTEMPT_OF    # deo  broj tekuceg pokusaja
 # Pomocne funkcije
 
 die() {
     echo "ERROR: $1" >&2
     log ERROR "$1"
     exit "${2:-2}"
+}
+
+now(){
+    date +%s.%N
 }
 
 level_num(){
@@ -106,6 +115,37 @@ split_input(){
     log INFO "Split into ${#delovi[@]} chunks ($ukupno rows)"
 }
 
+manifest_init(){
+    local f ime n 
+    MANIFEST="$RUN_DIR/manifest.csv"
+
+    echo "chunk,status,attempts,rows,duration_s,exit_code,reason" > "$MANIFEST"
+    for f in "$RUN_DIR"/chunks/chunk_*.csv; do
+        ime="${f##*/}"
+        ime="${ime%.csv}"
+        n=$(( $(wc -l < "$f") - 1 ))
+        echo "$ime,pending,0,$n,,," >> "$MANIFEST"
+    done
+}
+
+# promeni red jednog dela pod kljuca
+manifest_set(){
+    local ime="$1" status="$2" pokusaji="$3" trajanje="$4" kod="$5" razlog="$6"
+    (
+        flock 9
+        awk -F, -v OFS=, \
+            -v c="$ime" -v s="$status" -v a="$pokusaji" -v d="$trajanje" -v e="$kod" -v r="$razlog" \
+            '$1 == c { $2 = s; $3 = a; $5 = d; $6 = e; $7 = r } { print }' \
+            "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+    ) 9> "$RUN_DIR/manifest.lock"
+}
+
+manifest_get(){
+    local ime="$1" kolona="$2"
+    awk -F, -v c="$ime" -v k="$kolona" '$1 == c { print $k }' "$MANIFEST"
+
+}
+
 
 validate_output(){
     local izlaz="$1"
@@ -134,41 +174,81 @@ validate_output(){
     return 0
 }
 
-run_chunk(){
-    local ime="$1"
-    local pokusaj="$2"
+start_chunk(){
+    local ime="$1" pokusaj="$2"
     local ulaz="$RUN_DIR/chunks/$ime.csv"
     local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
     local err="$RUN_DIR/logs/$ime.$pokusaj.err"
-    local kod
 
-    log INFO "$ime attempt $pokusaj started"
+    manifest_set "$ime" running "$pokusaj" "" "" ""
 
     "${CONF[python]}" "${CONF[processor]}" \
         --input "$ulaz" --output "$izlaz_tmp" --group-by "${CONF[group_by]}" \
-        2> "$err"
-    kod=$?
+        2> "$err" &
+
+    PID_OF[$ime]=$!
+    START_OF[$ime]=$(now)
+    ATTEMPT_OF[$ime]=$pokusaj
+    log INFO "$ime attempt $pokusaj started (pid ${PID_OF[$ime]})"
+}
+
+finish_chunk(){
+    local ime="$1" kod="$2"
+    local pokusaj="${ATTEMPT_OF[$ime]}"
+    local ulaz="$RUN_DIR/chunks/$ime.csv"
+    local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
+    local trajanje
+
+    trajanje=$(awk -v a="${START_OF[$ime]}" -v b="$(now)" 'BEGIN { printf "%.2f", b - a }')
 
     if (( kod == 0 )) && validate_output "$izlaz_tmp" "$ulaz"; then
         mv "$izlaz_tmp" "$RUN_DIR/results/$ime.out"
-        log INFO "$ime attempt $pokusaj done"
+        log INFO "$ime attempt $pokusaj done (${trajanje}s)"
+        manifest_set "$ime" done "$pokusaj" "$trajanje" 0 ""
     elif (( kod == 0 )); then
         rm -f "$izlaz_tmp"
         log WARN "$ime attempt $pokusaj failed (exit=0, reason=corrupt)"
-        kod=1
+        manifest_set "$ime" failed "$pokusaj" "$trajanje" 0 corrupt
     else
         rm -f "$izlaz_tmp"
-        log WARN "$ime attempt $pokusaj failed (exit=$kod)"
+        log WARN "$ime attempt $pokusaj failed (exit=$kod, reason=error)"
+        manifest_set "$ime" failed "$pokusaj" "$trajanje" "$kod" error
     fi
-    return "$kod"
+
+    unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]"
 }
 
+
 process_chunks(){
-    local f ime
+    local f ime pid kod
+    local cekaju=()
+    local sledeci=0
+
+    # spisak svih delova koje treba obraditi
     for f in "$RUN_DIR"/chunks/chunk_*.csv; do
         ime="${f##*/}"
-        ime="${ime%.csv}"
-        run_chunk "$ime" 1
+        cekaju+=( "${ime%.csv}" )
+    done
+
+    while (( sledeci < ${#cekaju[@]} || ${#PID_OF[@]} > 0 )); do
+
+        
+        while (( ${#PID_OF[@]} < CONF[workers] && sledeci < ${#cekaju[@]} )); do
+            start_chunk "${cekaju[$sledeci]}" 1
+            (( sledeci++ ))
+        done
+
+        
+        for ime in "${!PID_OF[@]}"; do
+            pid="${PID_OF[$ime]}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid"
+                kod=$?
+                finish_chunk "$ime" "$kod"
+            fi
+        done
+
+        sleep 0.2
     done
 }
 
@@ -185,12 +265,19 @@ merge_results(){
         cilj="$RUN_DIR/result.partial.csv"
     fi
 
-    #jos jedna provera
+    # jos jedna provera
     for f in "${rezultati[@]}"; do
         ime="${f##*/}"
         ime="${ime%.out}"
         validate_output "$f" "$RUN_DIR/chunks/$ime.csv" || die "rezultat nije ispravan: $ime"
     done
+
+    # nema nijednog rezultata → samo zaglavlje, bez awk
+    if (( ${#rezultati[@]} == 0 )); then
+        echo "$zaglavlje" > "$cilj.tmp" && mv "$cilj.tmp" "$cilj"
+        log WARN "No successful results, ${cilj##*/} contains only header"
+        return
+    fi
 
     # 3) spoji, sortiraj i upiši u privremeni fajl
     {
@@ -418,6 +505,7 @@ cmd_run() {
         log WARN "$w"
     done
     split_input "$cli_input"
+    manifest_init
     process_chunks
     merge_results
     echo "Run $RUN_ID finished (result: $RUN_DIR/result.csv)"
