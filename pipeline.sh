@@ -9,6 +9,14 @@ RUN_DIR=""
 LOG_FILE=""
 CONFIG_WARNINGS=()
 MANIFEST=""
+CHUNKS=()
+RUN_START=0
+ABORTED=0
+
+declare -A STATE
+declare -A TRIES
+declare -A READY_AT
+declare -A LAST_REASON 
 declare -A PID_OF        # deo  PID procesa koji ga obradjuje
 declare -A START_OF      # deo  vreme pocetka (za duration_s)
 declare -A ATTEMPT_OF    # deo  broj tekuceg pokusaja
@@ -146,6 +154,24 @@ manifest_get(){
 
 }
 
+# upisi ili promeni kljuc u run.meta
+meta_set(){
+    local kljuc="$1" vrednost="$2" f="$RUN_DIR/run.meta"
+    awk -F= -v k="$kljuc" -v v="$vrednost" '
+        $1 == k { print k "=" v; nadjen = 1; next }
+        { print }
+        END { if (!nadjen) print k "=" v }
+    ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# koliko delova je u datom stanju 
+count_state(){
+    local trazeno="$1" ime n=0
+    for ime in "${CHUNKS[@]}"; do
+        [[ "${STATE[$ime]}" == "$trazeno" ]] && (( n++ ))
+    done
+    echo "$n"
+}
 
 validate_output(){
     local izlaz="$1"
@@ -174,14 +200,32 @@ validate_output(){
     return 0
 }
 
+# izlazni kod
+classify_exit(){
+    case "$1" in
+        1) echo error ;;
+        2) echo usage_error ;;
+        137) echo crash ;;
+        *) echo unknown ;;
+    esac
+}
+
+# cekanje pre k-tog ponavljanja
+backoff_for(){
+    local k="$1"
+    local d=$(( CONF[backoff_base] * 2 ** (k - 1) ))
+    (( d > CONF[backoff_max] )) && d=${CONF[backoff_max]}
+    echo "$d"
+}
+
 start_chunk(){
     local ime="$1" pokusaj="$2"
     local ulaz="$RUN_DIR/chunks/$ime.csv"
     local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
     local err="$RUN_DIR/logs/$ime.$pokusaj.err"
 
-    manifest_set "$ime" running "$pokusaj" "" "" ""
-
+    manifest_set "$ime" running "$pokusaj" "" "" "${LAST_REASON[$ime]}"
+    
     "${CONF[python]}" "${CONF[processor]}" \
         --input "$ulaz" --output "$izlaz_tmp" --group-by "${CONF[group_by]}" \
         2> "$err" &
@@ -192,64 +236,126 @@ start_chunk(){
     log INFO "$ime attempt $pokusaj started (pid ${PID_OF[$ime]})"
 }
 
+# zaustavi jedan proces: SIGTERM, pa posle kill_grace sekundi SIGKILL ako je jos ziv
+stop_pid(){
+    local pid="$1" i
+    kill -TERM "$pid" 2>/dev/null
+    for (( i = 0; i < CONF[kill_grace] * 10; i++ )); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+}
+
+# zaustavi sve delove koji rade i vrati ih na čekanje
+stop_running(){
+    local ime
+    for ime in "${!PID_OF[@]}"; do
+        stop_pid "${PID_OF[$ime]}"
+        rm -f "$RUN_DIR/chunks/$ime.out.tmp"
+        STATE[$ime]=pending
+        manifest_set "$ime" pending "${TRIES[$ime]}" "" "" interrupted
+        unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]"
+    done
+}
+
 finish_chunk(){
     local ime="$1" kod="$2"
-    local pokusaj="${ATTEMPT_OF[$ime]}"
+    local pokusaj="${TRIES[$ime]}"
     local ulaz="$RUN_DIR/chunks/$ime.csv"
     local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
-    local trajanje
+    local trajanje razlog cekanje
 
     trajanje=$(awk -v a="${START_OF[$ime]}" -v b="$(now)" 'BEGIN { printf "%.2f", b - a }')
+    unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]"
 
+    
     if (( kod == 0 )) && validate_output "$izlaz_tmp" "$ulaz"; then
         mv "$izlaz_tmp" "$RUN_DIR/results/$ime.out"
+        STATE[$ime]=done
         log INFO "$ime attempt $pokusaj done (${trajanje}s)"
-        manifest_set "$ime" done "$pokusaj" "$trajanje" 0 ""
-    elif (( kod == 0 )); then
-        rm -f "$izlaz_tmp"
-        log WARN "$ime attempt $pokusaj failed (exit=0, reason=corrupt)"
-        manifest_set "$ime" failed "$pokusaj" "$trajanje" 0 corrupt
-    else
-        rm -f "$izlaz_tmp"
-        log WARN "$ime attempt $pokusaj failed (exit=$kod, reason=error)"
-        manifest_set "$ime" failed "$pokusaj" "$trajanje" "$kod" error
+        manifest_set "$ime" done "$pokusaj" "$trajanje" 0 "${LAST_REASON[$ime]}"
+        return
     fi
 
-    unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]"
+    rm -f "$izlaz_tmp"
+    if (( kod == 0 )); then
+        razlog=corrupt
+    else
+        razlog=$(classify_exit "$kod")
+        if [[ "$razlog" == unknown ]]; then
+            log WARN "$ime attempt $pokusaj: unknown exit code $kod"
+            razlog=error
+        fi
+    fi
+    LAST_REASON[$ime]="$razlog"
+
+    if [[ "$razlog" == usage_error ]] || (( pokusaj >= 1 + CONF[max_retries] )); then
+        STATE[$ime]=failed
+        log WARN "$ime attempt $pokusaj failed (exit=$kod, reason=$razlog), no more retries"
+        manifest_set "$ime" failed "$pokusaj" "$trajanje" "$kod" "$razlog"
+        return
+    fi
+
+    cekanje=$(backoff_for "$pokusaj")
+    READY_AT[$ime]=$(( $(date +%s) + cekanje ))
+    STATE[$ime]=pending
+    log WARN "$ime attempt $pokusaj failed (exit=$kod, reason=$razlog), retry in ${cekanje}s"
+    manifest_set "$ime" pending "$pokusaj" "$trajanje" "$kod" "$razlog"
 }
 
 
 process_chunks(){
-    local f ime pid kod
-    local cekaju=()
-    local sledeci=0
+    local f ime pid kod sada
 
-    # spisak svih delova koje treba obraditi
     for f in "$RUN_DIR"/chunks/chunk_*.csv; do
         ime="${f##*/}"
-        cekaju+=( "${ime%.csv}" )
+        ime="${ime%.csv}"
+        CHUNKS+=( "$ime" )
+        STATE[$ime]=pending
+        TRIES[$ime]=0
+        READY_AT[$ime]=0
     done
 
-    while (( sledeci < ${#cekaju[@]} || ${#PID_OF[@]} > 0 )); do
+    while has_work; do
+        sada=$(date +%s)
 
-        
-        while (( ${#PID_OF[@]} < CONF[workers] && sledeci < ${#cekaju[@]} )); do
-            start_chunk "${cekaju[$sledeci]}" 1
-            (( sledeci++ ))
+        for ime in "${CHUNKS[@]}"; do
+            (( ${#PID_OF[@]} < CONF[workers] )) || break
+            if [[ "${STATE[$ime]}" == pending ]] && (( READY_AT[$ime] <= sada )); then
+                (( TRIES[$ime]++ ))
+                STATE[$ime]=running
+                start_chunk "$ime" "${TRIES[$ime]}"
+            fi
         done
 
-        
         for ime in "${!PID_OF[@]}"; do
             pid="${PID_OF[$ime]}"
             if ! kill -0 "$pid" 2>/dev/null; then
-                wait "$pid"
+                wait "$pid" 2>/dev/null
                 kod=$?
                 finish_chunk "$ime" "$kod"
             fi
         done
+        
+        if (( $(count_state failed) > CONF[max_failed_chunks] )); then
+            log ERROR "Too many failed chunks ($(count_state failed) > ${CONF[max_failed_chunks]}), aborting"
+            stop_running
+            ABORTED=1
+            return
+        fi
 
         sleep 0.2
     done
+}
+
+has_work(){
+    local ime
+    for ime in "${CHUNKS[@]}"; do
+        [[ "${STATE[$ime]}" == pending || "${STATE[$ime]}" == running ]] && return 0
+    done
+    return 1
 }
 
 merge_results(){
@@ -303,7 +409,17 @@ merge_results(){
     mv "$cilj.tmp" "$cilj"
     log INFO "Merged ${#rezultati[@]} results into ${cilj##*/}"
 
+}
 
+finish_run(){
+    local status="$1" kod="$2" poruka="$3"
+    local trajanje=$(( $(date +%s) - RUN_START ))
+
+    meta_set finished "$(date '+%Y-%m-%d %H:%M:%S')"
+    meta_set status "$status"
+    log INFO "Run finished: status=$status, duration=${trajanje}s"
+    echo "Run finished: $status ($poruka)"
+    exit "$kod"
 }
 
 set_defaults(){
@@ -498,6 +614,7 @@ cmd_run() {
     validate_config
     preflight_checks "$cli_input"
     create_run_dir
+    RUN_START=$(date +%s)
     write_snapshot
     write_meta
     log INFO "Run $RUN_ID started (input=$cli_input, workers=${CONF[workers]})"
@@ -507,8 +624,20 @@ cmd_run() {
     split_input "$cli_input"
     manifest_init
     process_chunks
+        
+
+    if (( ABORTED )); then
+        finish_run aborted 4 "too many failed chunks"
+    fi
+
     merge_results
-    echo "Run $RUN_ID finished (result: $RUN_DIR/result.csv)"
+
+    if (( $(count_state failed) == 0 )); then
+        [[ "${CONF[keep_chunks]}" == no ]] && rm -rf "$RUN_DIR/chunks"
+        finish_run completed 0 "result: $RUN_DIR/result.csv"
+    else
+        finish_run partial 1 "result: $RUN_DIR/result.partial.csv"
+    fi
 
 
 
