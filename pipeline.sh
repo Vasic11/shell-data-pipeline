@@ -13,6 +13,10 @@ CHUNKS=()
 RUN_START=0
 ABORTED=0
 
+declare -A ERR_OF        # deo → putanja do .err fajla tekuceg pokusaja
+declare -A LINES_OF      # deo → broj linija u .err pri poslednjoj proveri
+declare -A PROGRESS_AT   # deo → kada se broj linija poslednji put promenio
+declare -A HUNG          # deo → 1 ako smo ga ubili zbog zaglavljivanja
 declare -A STATE
 declare -A TRIES
 declare -A READY_AT
@@ -233,18 +237,24 @@ start_chunk(){
     PID_OF[$ime]=$!
     START_OF[$ime]=$(now)
     ATTEMPT_OF[$ime]=$pokusaj
+    ERR_OF[$ime]="$err"
+    LINES_OF[$ime]=0
+    PROGRESS_AT[$ime]=$(date +%s)
     log INFO "$ime attempt $pokusaj started (pid ${PID_OF[$ime]})"
 }
 
 # zaustavi jedan proces: SIGTERM, pa posle kill_grace sekundi SIGKILL ako je jos ziv
 stop_pid(){
-    local pid="$1" i
+    local pid="$1" oznaka="$2" i
     kill -TERM "$pid" 2>/dev/null
     for (( i = 0; i < CONF[kill_grace] * 10; i++ )); do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    if kill -0 "$pid" 2>/dev/null; then
+        [[ -n "$oznaka" ]] && log WARN "$oznaka still alive after ${CONF[kill_grace]}s, sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null
+    fi
     wait "$pid" 2>/dev/null
 }
 
@@ -260,6 +270,30 @@ stop_running(){
     done
 }
 
+# proveri da li se neki deo zaglavio (nema novih linija u .err)
+check_hangs(){
+    local ime pid n sada
+    sada=$(date +%s)
+
+    for ime in "${!PID_OF[@]}"; do
+        pid="${PID_OF[$ime]}"
+        kill -0 "$pid" 2>/dev/null || continue      # zavrsio je, to obrađuje nadzornik
+
+        n=$(wc -l < "${ERR_OF[$ime]}")
+        if (( n != LINES_OF[$ime] )); then
+            # ima napretka: zapamti novi broj linija i vreme
+            LINES_OF[$ime]=$n
+            PROGRESS_AT[$ime]=$sada
+        elif (( sada - PROGRESS_AT[$ime] >= CONF[hang_timeout] )); then
+            # nema napretka hang_timeout sekundi: zaglavio se
+            log WARN "$ime attempt ${TRIES[$ime]} hang detected (no progress for ${CONF[hang_timeout]}s), sending SIGTERM"
+            HUNG[$ime]=1
+            stop_pid "$pid" "$ime"
+            finish_chunk "$ime" "$?"
+        fi
+    done
+}
+
 finish_chunk(){
     local ime="$1" kod="$2"
     local pokusaj="${TRIES[$ime]}"
@@ -268,8 +302,7 @@ finish_chunk(){
     local trajanje razlog cekanje
 
     trajanje=$(awk -v a="${START_OF[$ime]}" -v b="$(now)" 'BEGIN { printf "%.2f", b - a }')
-    unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]"
-
+    unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]" "ERR_OF[$ime]" "LINES_OF[$ime]" "PROGRESS_AT[$ime]"
     
     if (( kod == 0 )) && validate_output "$izlaz_tmp" "$ulaz"; then
         mv "$izlaz_tmp" "$RUN_DIR/results/$ime.out"
@@ -280,7 +313,10 @@ finish_chunk(){
     fi
 
     rm -f "$izlaz_tmp"
-    if (( kod == 0 )); then
+    if [[ -n "${HUNG[$ime]}" ]]; then
+        razlog=hang
+        unset "HUNG[$ime]"
+    elif (( kod == 0 )); then
         razlog=corrupt
     else
         razlog=$(classify_exit "$kod")
@@ -329,6 +365,8 @@ process_chunks(){
                 start_chunk "$ime" "${TRIES[$ime]}"
             fi
         done
+
+        check_hangs
 
         for ime in "${!PID_OF[@]}"; do
             pid="${PID_OF[$ime]}"
@@ -420,6 +458,15 @@ finish_run(){
     log INFO "Run finished: status=$status, duration=${trajanje}s"
     echo "Run finished: $status ($poruka)"
     exit "$kod"
+}
+
+# Ctrl+C ili SIGTERM: zaustavi sve, vrati running u pending, status interrupted
+on_signal(){
+    trap '' INT TERM      # ignorisi nove signale dok cistimo vise Ctrl + C
+    echo "Interrupted, stopping ${#PID_OF[@]} running chunks..." >&2
+    log WARN "Interrupted by signal, stopping ${#PID_OF[@]} running chunks"
+    stop_running
+    finish_run interrupted 130 "interrupted"
 }
 
 set_defaults(){
@@ -615,6 +662,7 @@ cmd_run() {
     preflight_checks "$cli_input"
     create_run_dir
     RUN_START=$(date +%s)
+    trap on_signal INT TERM
     write_snapshot
     write_meta
     log INFO "Run $RUN_ID started (input=$cli_input, workers=${CONF[workers]})"
