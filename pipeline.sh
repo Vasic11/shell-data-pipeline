@@ -266,7 +266,7 @@ stop_running(){
         rm -f "$RUN_DIR/chunks/$ime.out.tmp"
         STATE[$ime]=pending
         manifest_set "$ime" pending "${TRIES[$ime]}" "" "" interrupted
-        unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]"
+        unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]" "ERR_OF[$ime]" "LINES_OF[$ime]" "PROGRESS_AT[$ime]"
     done
 }
 
