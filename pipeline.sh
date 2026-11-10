@@ -79,6 +79,12 @@ create_run_dir(){
     touch "$LOG_FILE"
 }
 
+# samo jedna instanca po pokretanju; druga izlazi odmah sa kodom 3
+lock_run(){
+    exec 8> "$RUN_DIR/run.lock"
+    flock -n 8 || die "nad pokretanjem $RUN_ID vec radi druga instanca" 3
+}
+
 write_snapshot(){
     local k
     for k in "${!CONF[@]}"; do
@@ -225,14 +231,14 @@ backoff_for(){
 start_chunk(){
     local ime="$1" pokusaj="$2"
     local ulaz="$RUN_DIR/chunks/$ime.csv"
-    local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
+    local izlaz_tmp="$RUN_DIR/chunks/$ime.$pokusaj.out.tmp"
     local err="$RUN_DIR/logs/$ime.$pokusaj.err"
 
     manifest_set "$ime" running "$pokusaj" "" "" "${LAST_REASON[$ime]}"
     
     "${CONF[python]}" "${CONF[processor]}" \
         --input "$ulaz" --output "$izlaz_tmp" --group-by "${CONF[group_by]}" \
-        2> "$err" &
+        2> "$err" 8>&- &
 
     PID_OF[$ime]=$!
     START_OF[$ime]=$(now)
@@ -258,12 +264,12 @@ stop_pid(){
     wait "$pid" 2>/dev/null
 }
 
-# zaustavi sve delove koji rade i vrati ih na čekanje
+# zaustavi sve delove koji rade i vrati ih na cekanje
 stop_running(){
     local ime
     for ime in "${!PID_OF[@]}"; do
         stop_pid "${PID_OF[$ime]}"
-        rm -f "$RUN_DIR/chunks/$ime.out.tmp"
+        rm -f "$RUN_DIR/chunks/$ime.${TRIES[$ime]}.out.tmp"
         STATE[$ime]=pending
         manifest_set "$ime" pending "${TRIES[$ime]}" "" "" interrupted
         unset "PID_OF[$ime]" "START_OF[$ime]" "ATTEMPT_OF[$ime]" "ERR_OF[$ime]" "LINES_OF[$ime]" "PROGRESS_AT[$ime]"
@@ -277,7 +283,7 @@ check_hangs(){
 
     for ime in "${!PID_OF[@]}"; do
         pid="${PID_OF[$ime]}"
-        kill -0 "$pid" 2>/dev/null || continue      # zavrsio je, to obrađuje nadzornik
+        kill -0 "$pid" 2>/dev/null || continue      # zavrsio je, to obradjuje nadzornik
 
         n=$(wc -l < "${ERR_OF[$ime]}")
         if (( n != LINES_OF[$ime] )); then
@@ -298,7 +304,7 @@ finish_chunk(){
     local ime="$1" kod="$2"
     local pokusaj="${TRIES[$ime]}"
     local ulaz="$RUN_DIR/chunks/$ime.csv"
-    local izlaz_tmp="$RUN_DIR/chunks/$ime.out.tmp"
+    local izlaz_tmp="$RUN_DIR/chunks/$ime.$pokusaj.out.tmp"
     local trajanje razlog cekanje
 
     trajanje=$(awk -v a="${START_OF[$ime]}" -v b="$(now)" 'BEGIN { printf "%.2f", b - a }')
@@ -345,14 +351,6 @@ finish_chunk(){
 process_chunks(){
     local f ime pid kod sada
 
-    for f in "$RUN_DIR"/chunks/chunk_*.csv; do
-        ime="${f##*/}"
-        ime="${ime%.csv}"
-        CHUNKS+=( "$ime" )
-        STATE[$ime]=pending
-        TRIES[$ime]=0
-        READY_AT[$ime]=0
-    done
 
     while has_work; do
         sada=$(date +%s)
@@ -386,6 +384,61 @@ process_chunks(){
 
         sleep 0.2
     done
+}
+
+# početno stanje za novo pokretanje: svi delovi čekaju
+init_state_new(){
+    local f ime
+    for f in "$RUN_DIR"/chunks/chunk_*.csv; do
+        ime="${f##*/}"
+        ime="${ime%.csv}"
+        CHUNKS+=( "$ime" )
+        STATE[$ime]=pending
+        TRIES[$ime]=0
+        READY_AT[$ime]=0
+    done
+}
+
+# pocetno stanje za resume: procitaj manifest i popravi ga
+init_state_resume(){
+    local ime status pokusaji ostalo
+    local n_done=0 n_pending=0 n_failed=0
+
+    while IFS=, read -r ime status pokusaji ostalo; do
+        [[ "$ime" == chunk ]] && continue          # preskoci zaglavlje
+        CHUNKS+=( "$ime" )
+        TRIES[$ime]=$pokusaji
+        READY_AT[$ime]=0
+        LAST_REASON[$ime]="${ostalo##*,}"
+        
+        case "$status" in
+            done)
+                if validate_output "$RUN_DIR/results/$ime.out" "$RUN_DIR/chunks/$ime.csv"; then
+                    STATE[$ime]=done
+                else
+                    log WARN "$ime: result missing or invalid, back to pending"
+                    STATE[$ime]=pending
+                    manifest_set "$ime" pending "$pokusaji" "" "" ""
+                fi
+                ;;
+            running)
+                STATE[$ime]=pending
+                manifest_set "$ime" pending "$pokusaji" "" "" interrupted
+                ;;
+            failed)
+                STATE[$ime]=failed
+                ;;
+            *)
+                STATE[$ime]=pending
+                ;;
+        esac
+    done < "$MANIFEST"
+
+    n_done=$(count_state done)
+    n_pending=$(count_state pending)
+    n_failed=$(count_state failed)
+    log INFO "Resuming $RUN_ID: $n_done done, $n_pending pending, $n_failed failed"
+    echo "Resuming $RUN_ID: $n_done done, $n_pending pending"
 }
 
 has_work(){
@@ -467,6 +520,24 @@ on_signal(){
     log WARN "Interrupted by signal, stopping ${#PID_OF[@]} running chunks"
     stop_running
     finish_run interrupted 130 "interrupted"
+}
+
+# nadzornik, spajanje i kraj: zajedničko za run i resume
+run_to_end(){
+    process_chunks
+
+    if (( ABORTED )); then
+        finish_run aborted 4 "too many failed chunks"
+    fi
+
+    merge_results
+
+    if (( $(count_state failed) == 0 )); then
+        [[ "${CONF[keep_chunks]}" == no ]] && rm -rf "$RUN_DIR/chunks"
+        finish_run completed 0 "result: $RUN_DIR/result.csv"
+    else
+        finish_run partial 1 "result: $RUN_DIR/result.partial.csv"
+    fi
 }
 
 set_defaults(){
@@ -661,6 +732,7 @@ cmd_run() {
     validate_config
     preflight_checks "$cli_input"
     create_run_dir
+    lock_run
     RUN_START=$(date +%s)
     trap on_signal INT TERM
     write_snapshot
@@ -671,28 +743,36 @@ cmd_run() {
     done
     split_input "$cli_input"
     manifest_init
-    process_chunks
-        
-
-    if (( ABORTED )); then
-        finish_run aborted 4 "too many failed chunks"
-    fi
-
-    merge_results
-
-    if (( $(count_state failed) == 0 )); then
-        [[ "${CONF[keep_chunks]}" == no ]] && rm -rf "$RUN_DIR/chunks"
-        finish_run completed 0 "result: $RUN_DIR/result.csv"
-    else
-        finish_run partial 1 "result: $RUN_DIR/result.partial.csv"
-    fi
-
-
+    init_state_new
+    run_to_end
+    
 
 }
 
-cmd_resume() {
-    echo "resume: nije implementirano"
+cmd_resume(){
+    local run_id="$1"
+    [[ -n "$run_id" ]] || die "resume zahteva run_id"
+
+    # konfig iz snapshota tog pokretanja
+    set_defaults
+    [[ -f "./runs/$run_id/config.snapshot" ]] || die "pokretanje ne postoji: $run_id"
+    load_config "./runs/$run_id/config.snapshot"
+    validate_config
+
+    RUN_ID="$run_id"
+    RUN_DIR="${CONF[work_dir]}/$RUN_ID"
+    LOG_FILE="$RUN_DIR/pipeline.log"
+    MANIFEST="$RUN_DIR/manifest.csv"
+    [[ -d "$RUN_DIR/chunks" ]] || die "delovi ne postoje, nastavak nije moguc: $RUN_ID"
+
+    lock_run
+    RUN_START=$(date +%s)
+    trap on_signal INT TERM
+    meta_set status running
+    log INFO "Run $RUN_ID resumed"
+
+    init_state_resume
+    run_to_end
 }
 
 cmd_status() {
