@@ -97,6 +97,7 @@ write_meta(){
     cat > "$RUN_DIR/run.meta" <<EOF
 run_id=$RUN_ID
 input=$cli_input
+input_bytes=$(stat -c %s "$cli_input")
 started=$(date '+%Y-%m-%d %H:%M:%S')
 status=running
 EOF
@@ -172,6 +173,12 @@ meta_set(){
         { print }
         END { if (!nadjen) print k "=" v }
     ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# procitaj vrednost ključa iz run.meta datog run foldera
+meta_get(){
+    local dir="$1" kljuc="$2"
+    awk -F= -v k="$kljuc" '$1 == k { sub(/^[^=]*=/, ""); print }' "$dir/run.meta"
 }
 
 # koliko delova je u datom stanju 
@@ -508,9 +515,75 @@ finish_run(){
 
     meta_set finished "$(date '+%Y-%m-%d %H:%M:%S')"
     meta_set status "$status"
+    write_history "$status" "$trajanje" 
+    write_report "$status" "$trajanje"
     log INFO "Run finished: status=$status, duration=${trajanje}s"
     echo "Run finished: $status ($poruka)"
     exit "$kod"
+}
+
+# dodaj red u work_dir/history.csv (pod kljucem, jer vise pokretanja moze da pise istovremeno)
+write_history(){
+    local status="$1" trajanje="$2"
+    local fajl="${CONF[work_dir]}/history.csv"
+    local zaglavlje="run_id,started,finished,status,chunks,failed,rows,duration_s"
+    local started finished redova
+
+    started=$(meta_get "$RUN_DIR" started)
+    finished=$(meta_get "$RUN_DIR" finished)
+    redova=$(awk -F, 'NR > 1 { s += $4 } END { print s + 0 }' "$MANIFEST")
+
+    (
+        flock 7
+        [[ -s "$fajl" ]] || echo "$zaglavlje" > "$fajl"
+        echo "$RUN_ID,$started,$finished,$status,${#CHUNKS[@]},$(count_state failed),$redova,$trajanje" >> "$fajl"
+    ) 7> "${CONF[work_dir]}/history.lock"
+}
+
+# napravi report.txt na kraju pokretanja
+write_report(){
+    local status="$1" trajanje="$2"
+    local f="$RUN_DIR/report.txt"
+    local ulaz bajtova mb redova ukupno n_done n_failed pokusaja ponovljeni
+    local propusnost najsporiji neuspeli r fail_str=""
+
+    ulaz=$(meta_get "$RUN_DIR" input)
+    bajtova=$(meta_get "$RUN_DIR" input_bytes)
+    mb=$(awk -v b="${bajtova:-0}" 'BEGIN { printf "%.1f", b / 1048576 }')
+    redova=$(awk -F, 'NR > 1 { s += $4 } END { print s + 0 }' "$MANIFEST")
+
+    ukupno=${#CHUNKS[@]}
+    n_done=$(count_state done)
+    n_failed=$(count_state failed)
+    pokusaja=$(awk -F, 'NR > 1 { s += $3 } END { print s + 0 }' "$MANIFEST")
+    ponovljeni=$(awk -F, 'NR > 1 && $3 > 0 { s += $3 - 1 } END { print s + 0 }' "$MANIFEST")
+
+    for r in error crash corrupt hang usage_error; do
+        fail_str+="$r=$(grep -c "reason=$r)" "$LOG_FILE") "
+    done
+
+    (( trajanje > 0 )) || trajanje=1
+    propusnost=$(( redova / trajanje ))
+
+    najsporiji=$(awk -F, 'NR > 1 && $5 != "" { print $5, $1 }' "$MANIFEST" \
+        | sort -rn | head -n 3 \
+        | awk '{ printf "%s%s (%ss)", (NR > 1 ? ", " : ""), $2, $1 }')
+
+    neuspeli=$(awk -F, 'NR > 1 && $2 == "failed" { printf "%s%s", (n++ ? ", " : ""), $1 }' "$MANIFEST")
+
+    cat > "$f" <<EOF
+Run: $RUN_ID
+Input: $ulaz ($redova rows, $mb MB)
+Status: $status
+Chunks: $ukupno total, $n_done done, $n_failed failed
+Attempts: $pokusaja ($ponovljeni retries)
+Failures: ${fail_str% }
+Hang kills: $(grep -c "hang detected" "$LOG_FILE") SIGTERM, $(grep -c "sending SIGKILL" "$LOG_FILE") SIGKILL
+Duration: ${trajanje}s
+Throughput: $propusnost rows/s
+Slowest chunks: ${najsporiji:--}
+Failed chunks: ${neuspeli:--}
+EOF
 }
 
 # Ctrl+C ili SIGTERM: zaustavi sve, vrati running u pending, status interrupted
@@ -588,6 +661,11 @@ load_config(){
         done < "$fajl"
 }
 
+# za list/status/report/clean: ucitaj konfig samo da bismo znali work_dir
+load_basic_config(){
+    set_defaults
+    [[ -f "$SCRIPT_DIR/pipeline.conf" ]] && load_config "$SCRIPT_DIR/pipeline.conf"
+}
 
 is_pos_int() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
@@ -775,20 +853,111 @@ cmd_resume(){
     run_to_end
 }
 
-cmd_status() {
-    echo "status: nije implementirano"
+cmd_status(){
+    local run_id="$1" d ime status pokusaji ostalo sada pocetak linija napredak
+    load_basic_config
+
+    # bez run_id: poslednje pokretanje
+    if [[ -z "$run_id" ]]; then
+        local svi=( "${CONF[work_dir]}"/run_*/ )
+        (( ${#svi[@]} > 0 )) || die "nema nijednog pokretanja"
+        d="${svi[-1]%/}"
+    else
+        d="${CONF[work_dir]}/$run_id"
+    fi
+    [[ -f "$d/run.meta" ]] || die "pokretanje ne postoji: ${d##*/}"
+
+    echo "Run: ${d##*/}"
+    echo "Status: $(meta_get "$d" status)"
+
+    if [[ ! -f "$d/manifest.csv" ]]; then
+        echo "Chunks: (manifest još nije napravljen)"
+        return
+    fi
+
+    awk -F, 'NR > 1 { c[$2]++ }
+        END { printf "Chunks: %d pending, %d running, %d done, %d failed\n",
+              c["pending"], c["running"], c["done"], c["failed"] }' "$d/manifest.csv"
+
+    # detalji za delove koji rade
+    sada=$(date +%s)
+    while IFS=, read -r ime status pokusaji ostalo; do
+        [[ "$status" == running ]] || continue
+
+        linija=$(grep "$ime attempt $pokusaji started" "$d/pipeline.log" | tail -n 1)
+        pocetak=$(date -d "$(echo "$linija" | cut -c 2-20)" +%s 2>/dev/null || echo "$sada")
+        napredak=$(grep PROGRESS "$d/logs/$ime.$pokusaji.err" 2>/dev/null | tail -n 1)
+
+        echo "  $ime: attempt $pokusaji, running $(( sada - pocetak ))s, ${napredak:-no progress yet}"
+    done < "$d/manifest.csv"
 }
 
-cmd_report() {
-    echo "report: nije implementirano"
+cmd_report(){
+    local run_id="$1"
+    [[ -n "$run_id" ]] || die "report zahteva run_id"
+    load_basic_config
+    local f="${CONF[work_dir]}/$run_id/report.txt"
+    [[ -f "$f" ]] || die "izveštaj ne postoji (pokretanje nije završeno ili ne postoji): $run_id"
+    cat "$f"
 }
 
-cmd_list() {
-    echo "list: nije implementirano"
+cmd_list(){
+    local d id status started finished chunks trajanje
+    load_basic_config
+
+    printf "%-22s %-12s %-20s %7s %10s\n" RUN_ID STATUS STARTED CHUNKS DURATION
+    for d in "${CONF[work_dir]}"/run_*/; do
+        d="${d%/}"
+        id="${d##*/}"
+        [[ -f "$d/run.meta" ]] || continue
+
+        status=$(meta_get "$d" status)
+        started=$(meta_get "$d" started)
+        finished=$(meta_get "$d" finished)
+        chunks=$(( $(wc -l < "$d/manifest.csv" 2>/dev/null || echo 1) - 1 ))
+
+        if [[ -n "$finished" ]]; then
+            trajanje="$(( $(date -d "$finished" +%s) - $(date -d "$started" +%s) ))s"
+        else
+            trajanje="-"
+        fi
+
+        printf "%-22s %-12s %-20s %7s %10s\n" "$id" "$status" "$started" "$chunks" "$trajanje"
+    done
 }
 
-cmd_clean() {
-    echo "clean: nije implementirano"
+cmd_clean(){
+    local keep="" d svi=() i obrisano=0
+    load_basic_config
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --keep)
+                [[ -n "$2" ]] || die "opcija $1 zahteva vrednost"
+                keep="$2"
+                shift 2
+                ;;
+            *)
+                die "nepoznata opcija: $1"
+                ;;
+        esac
+    done
+    [[ -n "$keep" ]] || die "clean zahteva --keep N"
+    is_nonneg_int "$keep" || die "neispravna vrednost za --keep: '$keep'"
+
+    svi=( "${CONF[work_dir]}"/run_*/ )              # abecedno = hronoloski (najstariji na pocetku)
+    for (( i = 0; i < ${#svi[@]} - keep; i++ )); do
+        d="${svi[$i]%/}"
+        # preskoci pokretanje koje trenutno radi (zakljucano)
+        if ! ( flock -n 9 ) 9> "$d/run.lock"; then
+            echo "Skipping ${d##*/} (running)"
+            continue
+        fi
+        rm -rf "$d"
+        echo "Removed ${d##*/}"
+        (( obrisano++ ))
+    done
+    echo "Removed $obrisano run(s), kept ${keep} newest"
 }
 
 # Glavni deo
