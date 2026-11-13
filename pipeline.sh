@@ -607,9 +607,9 @@ run_to_end(){
 
     if (( $(count_state failed) == 0 )); then
         [[ "${CONF[keep_chunks]}" == no ]] && rm -rf "$RUN_DIR/chunks"
-        finish_run completed 0 "result: $RUN_DIR/result.csv"
+        finish_run completed 0 "result: ${RUN_DIR#./}/result.csv"
     else
-        finish_run partial 1 "result: $RUN_DIR/result.partial.csv"
+        finish_run partial 1 "result: ${RUN_DIR#./}/result.partial.csv"
     fi
 }
 
@@ -822,6 +822,7 @@ cmd_run() {
     split_input "$cli_input"
     manifest_init
     init_state_new
+    echo "Run $RUN_ID started (${#CHUNKS[@]} chunks, ${CONF[workers]} workers)"
     run_to_end
     
 
